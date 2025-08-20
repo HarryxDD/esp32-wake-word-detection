@@ -20,7 +20,7 @@ public:
     get(size_t index) const;
 
 private:
-    static const size_t ChunkCount = 5;
+    static const size_t ChunkCount = 2;
     static const size_t ChunkSize = 16000;
 
     class Chunk {

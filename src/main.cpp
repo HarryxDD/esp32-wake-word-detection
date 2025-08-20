@@ -8,8 +8,16 @@
 #include "AudioProcessor.hpp"
 #include "MemsMicrophone.hpp"
 #include "MemoryPool.hpp"
+#include "WiFiManager.hpp"
+#include "MQTTManager.hpp"
 
-static const char* TAG = "ESP32 TFLITE WWD - Main";
+static const char* TAG = "WWD";
+
+// Global instances
+static WiFiManager wifi_manager;
+static MQTTManager mqtt_manager;
+static float detection_threshold = 0.6f;
+static int recording_duration = 5000; // ms
 
 static void setup_led() {
     gpio_config_t led_conf = {
@@ -32,24 +40,81 @@ static void led_blink(int times, int delay_ms) {
     }
 }
 
+// MQTT configuration callback
+static void mqtt_config_callback(const mqtt_config_t* config) {
+    // Update global configuration
+    recording_duration = config->record_ms;
+    detection_threshold = config->min_conf;
+    
+    // Blink LED to indicate config update
+    led_blink(2, 100);
+}
+
+// WiFi and MQTT setup function
+static bool setup_connectivity() {
+    ESP_LOGI(TAG, "🚀 Starting connectivity setup...");
+    
+    if (!wifi_manager.initialize()) {
+        ESP_LOGE(TAG, "❌ Failed to initialize WiFi manager");
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ WiFi manager initialized");
+    
+    if (!wifi_manager.connect(WIFI_SSID, WIFI_PASSWORD)) {
+        ESP_LOGE(TAG, "❌ Failed to connect to WiFi");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "✅ WiFi connection established");
+    ESP_LOGI(TAG, "📡 Connected to: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "🌐 IP Address: %s", wifi_manager.getIPAddress());
+    
+    // Setup MQTT
+    ESP_LOGI(TAG, "🔧 Setting up MQTT...");
+    if (!mqtt_manager.initialize(MQTT_BROKER_HOST, MQTT_BROKER_PORT, DEVICE_ID, 
+                                MQTT_USERNAME, MQTT_PASSWORD)) {
+        ESP_LOGE(TAG, "❌ Failed to initialize MQTT manager");
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ MQTT manager initialized");
+    
+    mqtt_manager.setConfigCallback(mqtt_config_callback);
+    
+    if (!mqtt_manager.connect()) {
+        ESP_LOGE(TAG, "❌ Failed to connect to MQTT broker");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "✅ MQTT connection established");
+    ESP_LOGI(TAG, "🏠 Broker: %s:%d", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+    ESP_LOGI(TAG, "🆔 Device ID: %s", DEVICE_ID);
+    ESP_LOGI(TAG, "🌟 Connectivity setup complete!");
+    return true;
+}
+
 extern "C" [[noreturn]] void
 app_main()
 {
     // Setup LED first
     setup_led();
     
-    // Startup indication
-    ESP_LOGI(TAG, "=== ESP32 Wake Word Detection Starting ===");
-    ESP_LOGI(TAG, "Hardware: ESP32-WROOM-32 + INMP441");
-    ESP_LOGI(TAG, "INMP441 Pins - SCK: %d, WS: %d, SD: %d", I2S_INMP441_SCK, I2S_INMP441_WS, I2S_INMP441_SD);
-    ESP_LOGI(TAG, "LED Pin: %d", LED_PIN);
-    ESP_LOGI(TAG, "Sample Rate: %d Hz", I2S_SAMPLE_RATE);
-    
     // LED blink to show startup
     led_blink(3, 200);
     
+    // Setup WiFi and MQTT connectivity
+    if (!setup_connectivity()) {
+        ESP_LOGE(TAG, "Failed to setup connectivity");
+        // Error indication - fast blinks indefinitely
+        for(;;) {
+            led_blink(10, 50);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+    
+    // Connectivity success indication
+    led_blink(5, 100);
+    
     static const TickType_t kMaxBlockTime = pdMS_TO_TICKS(300);
-    static const float kDetectionThreshold = 0.5;
 
     ESP_LOGI(TAG, "Initializing Neural Network...");
     NeuralNetwork nn;
@@ -74,15 +139,13 @@ app_main()
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-    ESP_LOGI(TAG, "Microphone started successfully");
+    
+    ESP_LOGI(TAG, "Ready");
     
     // Ready indication - single long blink
     gpio_set_level(LED_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(1000));
     gpio_set_level(LED_PIN, 0);
-    
-    ESP_LOGI(TAG, "=== Wake Word Detection Ready ===");
-    ESP_LOGI(TAG, "Listening for 'Marvin'... (threshold: %.2f)", kDetectionThreshold);
 
     /**
      * Recognition loop (main task: CPU0)
@@ -100,13 +163,23 @@ app_main()
             
             loop_count++;
             
-            // Show activity every 100 loops (about every 30 seconds at 16kHz)
-            if (loop_count % 100 == 0) {
-                ESP_LOGI(TAG, "Processing... (loop: %lu, last output: %.3f)", loop_count, output);
+            // Send heartbeat every 1000 loops
+            if (loop_count % 1000 == 0 && mqtt_manager.isConnected()) {
+                mqtt_manager.publishHeartbeat();
             }
             
-            if (output > kDetectionThreshold) {
-                ESP_LOGI(TAG, "*** WAKE WORD DETECTED! *** Confidence: %.2f", output);
+            if (output > detection_threshold) {
+                ESP_LOGI(TAG, "DETECTED! %.2f", output);
+                
+                // Create and publish simple MQTT alert
+                mqtt_alert_t alert = {};
+                strncpy(alert.device_id, DEVICE_ID, sizeof(alert.device_id) - 1);
+                alert.confidence = output;
+                
+                if (mqtt_manager.isConnected()) {
+                    mqtt_manager.publishAlert(&alert);
+                }
+                
                 // Wake word detected - bright LED for 2 seconds
                 gpio_set_level(LED_PIN, 1);
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -114,8 +187,27 @@ app_main()
             }
         } else {
             // Timeout - brief LED blink to show we're alive
-            ESP_LOGW(TAG, "Timeout waiting for audio data");
+            ESP_LOGW(TAG, "Timeout waiting for audio data - checking connectivity...");
             led_blink(1, 50);
+            
+            // Check connectivity and try to reconnect if needed
+            bool wifi_status = wifi_manager.isConnected();
+            bool mqtt_status = mqtt_manager.isConnected();
+            
+            ESP_LOGI(TAG, "📊 Status - WiFi: %s | MQTT: %s | IP: %s", 
+                    wifi_status ? "✅ Connected" : "❌ Disconnected",
+                    mqtt_status ? "✅ Connected" : "❌ Disconnected",
+                    wifi_manager.getIPAddress());
+            
+            if (!wifi_status) {
+                ESP_LOGW(TAG, "🔄 WiFi disconnected - attempting reconnect...");
+                wifi_manager.reconnect(WIFI_SSID, WIFI_PASSWORD);
+            }
+            
+            if (!mqtt_status && wifi_status) {
+                ESP_LOGW(TAG, "🔄 MQTT disconnected - attempting reconnect...");
+                mqtt_manager.connect();
+            }
         }
     }
 }

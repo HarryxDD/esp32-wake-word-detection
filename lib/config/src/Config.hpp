@@ -5,6 +5,29 @@
 #define I2S_SAMPLE_BYTES (4)     // The total aboumt of bytes per sample
 #define I2S_SAMPLE_RATE (16000)  // The total amount of samples per second
 
+// WiFi Configuration
+#define WIFI_SSID "DNA-WIFI-A474"
+#define WIFI_PASSWORD "7tADYEhq"
+
+// MQTT Configuration
+#define MQTT_BROKER_HOST "192.168.1.176"  // Replace with your Raspberry Pi IP
+#define MQTT_BROKER_PORT 1883
+#define MQTT_USERNAME "harryxd"          // Replace with your MQTT username
+#define MQTT_PASSWORD "harryxd"      // Replace with your MQTT password
+#define DEVICE_ID "esp32_wwd_001"  // Unique device identifier
+#define DEVICE_LOCATION "living_room"  // Device location
+
+// MQTT Topics
+#define MQTT_TOPIC_ALERTS "alerts/" DEVICE_ID
+#define MQTT_TOPIC_STATUS "devices/" DEVICE_ID "/status"
+#define MQTT_TOPIC_HEARTBEAT "devices/" DEVICE_ID "/heartbeat"
+#define MQTT_TOPIC_CONFIG "config/" DEVICE_ID
+
+// MQTT Configuration
+#define MQTT_HEARTBEAT_INTERVAL_MS 30000  // 30 seconds
+#define MQTT_KEEPALIVE_SEC 60
+#define MQTT_CLEAN_SESSION true
+
 // INMP441 Pin Configuration (user's correct pins)
 #define I2S_INMP441_SCK (GPIO_NUM_32)  // Serial Clock
 #define I2S_INMP441_WS (GPIO_NUM_25)   // Word Select (Left/Right Clock)
