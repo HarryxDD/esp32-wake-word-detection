@@ -8,7 +8,7 @@
 #include <cJSON.h>
 
 typedef struct {
-    char device_id[16];
+    char device_id[32];
     float confidence;
 } mqtt_alert_t;
 

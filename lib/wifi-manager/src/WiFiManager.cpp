@@ -1,4 +1,5 @@
 #include "WiFiManager.hpp"
+#include <nvs.h>
 
 #define WIFI_AUTHMODE WIFI_AUTH_WPA2_PSK
 #define WIFI_CONNECTED_BIT BIT0
@@ -25,6 +26,14 @@ static void ip_event_cb(void *arg, esp_event_base_t event_base, int32_t event_id
         {
             ip_event_got_ip_t *event_ip = (ip_event_got_ip_t *)event_data;
             ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event_ip->ip_info.ip));
+            
+            // Store IP address in WiFiManager instance
+            WiFiManager* wifi_mgr = (WiFiManager*)arg;
+            if (wifi_mgr) {
+                snprintf((char*)wifi_mgr->ip_address, sizeof(wifi_mgr->ip_address), 
+                        IPSTR, IP2STR(&event_ip->ip_info.ip));
+            }
+            
             wifi_retry_count = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             break;
@@ -147,7 +156,7 @@ bool WiFiManager::initialize() {
     }
 
     ret = esp_event_handler_instance_register(
-        IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_cb, NULL, &ip_event_handler);
+        IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_cb, this, &ip_event_handler);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register IP event handler");
         return false;
@@ -238,4 +247,49 @@ void WiFiManager::reconnect(char* ssid, char* password) {
 
 const char* WiFiManager::getIPAddress() {
     return ip_address;
+}
+
+bool WiFiManager::connectWithStoredCredentials() {
+    if (!loadStoredCredentials()) {
+        ESP_LOGE(TAG, "No stored WiFi credentials found");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Connecting with stored credentials to: %s", stored_ssid);
+    return connect(stored_ssid, stored_password);
+}
+
+bool WiFiManager::loadStoredCredentials() {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    // Open NVS
+    err = nvs_open("wifi", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+        return false;
+    }
+    
+    // Get SSID
+    size_t ssid_len = sizeof(stored_ssid);
+    err = nvs_get_str(nvs_handle, "ssid", stored_ssid, &ssid_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading SSID from NVS: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return false;
+    }
+    
+    // Get password
+    size_t pass_len = sizeof(stored_password);
+    err = nvs_get_str(nvs_handle, "password", stored_password, &pass_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading password from NVS: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return false;
+    }
+    
+    nvs_close(nvs_handle);
+    
+    ESP_LOGI(TAG, "Loaded WiFi credentials for: %s", stored_ssid);
+    return true;
 }

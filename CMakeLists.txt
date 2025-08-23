@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.16.0)
 
 # Exclude unnecessary components to reduce binary size
 set(EXCLUDE_COMPONENTS
-    "bt"
     "console"
     "app_trace"
     "perfmon"
@@ -16,10 +15,6 @@ set(EXCLUDE_COMPONENTS
     "usb"
     "touch_element"
     "rmaker_common"
-    "json_parser"
-    "json_generator"
-    "cbor"
-    "jsmn"
     "openssl"
     "expat"
     "wear_levelling"

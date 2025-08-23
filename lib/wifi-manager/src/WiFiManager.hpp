@@ -17,6 +17,7 @@ public:
     
     bool initialize();
     bool connect(char* ssid, char* password);
+    bool connectWithStoredCredentials();  // New method for stored WiFi
     bool isConnected();
     void disconnect();
     void reconnect(char* ssid, char* password);
@@ -24,12 +25,16 @@ public:
     // Get IP address as string
     const char* getIPAddress();
     
+    // Public member for IP event callback access
+    char ip_address[16];
+    
 private:
     bool connected;
-    char ip_address[16];
     bool ap_fallback;
     char stored_ssid[32];
     char stored_password[64];
+    
+    bool loadStoredCredentials();  // New private method
     
     static const char* TAG;
 };

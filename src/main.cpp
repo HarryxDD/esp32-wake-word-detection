@@ -1,6 +1,6 @@
 #include <freertos/FreeRTOS.h>
 #include <driver/gpio.h>
-
+#include <esp_system.h>
 #include <esp_log.h>
 
 #include "Config.hpp"
@@ -10,6 +10,7 @@
 #include "MemoryPool.hpp"
 #include "WiFiManager.hpp"
 #include "MQTTManager.hpp"
+#include "bluetooth_provisioning.h" // Re-enabled for WiFi provisioning over Bluetooth
 
 static const char* TAG = "WWD";
 
@@ -18,6 +19,7 @@ static WiFiManager wifi_manager;
 static MQTTManager mqtt_manager;
 static float detection_threshold = 0.6f;
 static int recording_duration = 5000; // ms
+// device_id is declared as extern in bluetooth_provisioning.h
 
 static void setup_led() {
     gpio_config_t led_conf = {
@@ -54,20 +56,61 @@ static void mqtt_config_callback(const mqtt_config_t* config) {
 static bool setup_connectivity() {
     ESP_LOGI(TAG, "🚀 Starting connectivity setup...");
     
-    if (!wifi_manager.initialize()) {
-        ESP_LOGE(TAG, "❌ Failed to initialize WiFi manager");
-        return false;
+    // If no stored WiFi, go straight to WiFi AP provisioning BEFORE WiFi init
+    if (!has_stored_wifi()) {
+        ESP_LOGW(TAG, "📡 No stored WiFi credentials found - entering WiFi AP provisioning mode");
+        ESP_LOGI(TAG, "📱 Connect to WakeGuard-Setup-XXXX network to configure WiFi");
+        
+        // Try WiFi AP provisioning with proper error handling
+        start_wifi_ap_provisioning();
+        ESP_LOGI(TAG, "✅ Provisioning complete, continuing with normal operation...");
+        
+        // After provisioning, WiFi is already connected in APSTA mode
+        // We need to switch to STA mode and continue without WiFi Manager init
+        stop_provisioning_server();
+        ESP_LOGI(TAG, "🔄 Switching from AP+STA mode to STA mode only...");
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        ESP_LOGI(TAG, "✅ WiFi switched to STA mode, ready for normal operation");
+        
+        // Skip WiFi Manager initialization and go directly to MQTT setup
+    } else {
+        // Initialize WiFi manager only if we have stored credentials
+        if (!wifi_manager.initialize()) {
+            ESP_LOGE(TAG, "❌ Failed to initialize WiFi manager");
+            return false;
+        }
+        ESP_LOGI(TAG, "✅ WiFi manager initialized");
+        
+        // Try to connect with stored credentials with retries
+        ESP_LOGI(TAG, "🔄 Attempting to connect with stored credentials...");
+        int connection_attempts = 0;
+        const int max_attempts = 5;
+        bool connected = false;
+        
+        while (connection_attempts < max_attempts && !connected) {
+            connection_attempts++;
+            ESP_LOGI(TAG, "🔌 WiFi connection attempt %d/%d", connection_attempts, max_attempts);
+            
+            if (wifi_manager.connectWithStoredCredentials()) {
+                connected = true;
+                ESP_LOGI(TAG, "✅ WiFi connection established on attempt %d", connection_attempts);
+                break;
+            } else {
+                ESP_LOGE(TAG, "❌ WiFi connection attempt %d failed", connection_attempts);
+                if (connection_attempts < max_attempts) {
+                    ESP_LOGI(TAG, "⏳ Waiting 3 seconds before retry...");
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
+            }
+        }
+        
+        if (!connected) {
+            ESP_LOGE(TAG, "❌ Failed to connect to WiFi after %d attempts", max_attempts);
+            ESP_LOGE(TAG, "🔌 Device will continue without WiFi - check network availability");
+            return false;
+        }
+        ESP_LOGI(TAG, "🌐 IP Address: %s", wifi_manager.getIPAddress());
     }
-    ESP_LOGI(TAG, "✅ WiFi manager initialized");
-    
-    if (!wifi_manager.connect(WIFI_SSID, WIFI_PASSWORD)) {
-        ESP_LOGE(TAG, "❌ Failed to connect to WiFi");
-        return false;
-    }
-    
-    ESP_LOGI(TAG, "✅ WiFi connection established");
-    ESP_LOGI(TAG, "📡 Connected to: %s", WIFI_SSID);
-    ESP_LOGI(TAG, "🌐 IP Address: %s", wifi_manager.getIPAddress());
     
     // Setup MQTT
     ESP_LOGI(TAG, "🔧 Setting up MQTT...");
@@ -101,14 +144,23 @@ app_main()
     // LED blink to show startup
     led_blink(3, 200);
     
-    // Setup WiFi and MQTT connectivity
+    // Generate runtime Bluetooth device ID (used by provisioning module)
+    device_id = generate_device_id();
+    ESP_LOGI(TAG, "🆔 Device ID: %s (BT:%s)", DEVICE_ID, device_id.c_str());
+    
+    // Try to setup connectivity first
     if (!setup_connectivity()) {
-        ESP_LOGE(TAG, "Failed to setup connectivity");
-        // Error indication - fast blinks indefinitely
-        for(;;) {
-            led_blink(10, 50);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        }
+        ESP_LOGE(TAG, "❌ Failed to setup connectivity");
+        ESP_LOGI(TAG, "🗑️ Clearing any corrupted WiFi credentials...");
+        clear_stored_wifi();
+        ESP_LOGI(TAG, "🔵 Starting WiFi AP provisioning mode...");
+        
+        // Try WiFi AP provisioning with proper error handling
+        start_wifi_ap_provisioning();
+        
+        // Restart to use new credentials
+        ESP_LOGI(TAG, "🔄 Restarting to apply new WiFi credentials...");
+        esp_restart();
     }
     
     // Connectivity success indication
@@ -201,7 +253,7 @@ app_main()
             
             if (!wifi_status) {
                 ESP_LOGW(TAG, "🔄 WiFi disconnected - attempting reconnect...");
-                wifi_manager.reconnect(WIFI_SSID, WIFI_PASSWORD);
+                wifi_manager.reconnect(NULL, NULL);  // Use stored credentials
             }
             
             if (!mqtt_status && wifi_status) {

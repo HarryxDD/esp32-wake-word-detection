@@ -1,0 +1,966 @@
+#include "bluetooth_provisioning.h"
+#include "Config.hpp"
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_system.h>
+#include <driver/gpio.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_event.h>
+#include <lwip/err.h>
+#include <lwip/sys.h>
+#include <esp_efuse.h>
+#include <esp_mac.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Web server includes
+#include <esp_http_server.h>
+#include <esp_netif.h>
+#include <lwip/ip_addr.h>
+#include <esp_netif_ip_addr.h>
+
+// JSON parsing
+#include "cJSON.h"
+
+static const char* TAG = "WIFI_PROVISIONING";
+
+// Global variables
+std::string device_id;
+bool wifi_configured = false;
+static httpd_handle_t server = NULL;
+static esp_netif_t* ap_netif = NULL;
+static esp_netif_t* sta_netif = NULL;
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+
+// HTTP handlers
+static esp_err_t root_handler(httpd_req_t *req);
+static esp_err_t scan_handler(httpd_req_t *req);
+static esp_err_t connect_handler(httpd_req_t *req);
+static esp_err_t status_handler(httpd_req_t *req);
+
+// Forward declarations
+void blink_led(int times, int delay_ms);
+bool test_wifi_connection(const char* ssid, const char* password);
+
+// HTML page for captive portal
+static const char* setup_page_html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WakeGuard Setup</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 400px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; text-align: center; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        select, input[type="password"], button { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+        button { background: #3498db; color: white; border: none; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #2980b9; }
+        .status { margin-top: 15px; padding: 10px; border-radius: 5px; text-align: center; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .loading { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔒 WakeGuard Setup</h1>
+        <form id="wifiForm">
+            <div class="form-group">
+                <label for="ssid">Select WiFi Network:</label>
+                <select id="ssid" name="ssid" required>
+                    <option value="">Scanning networks...</option>
+                </select>
+                <button type="button" onclick="refreshNetworks()">🔄 Refresh</button>
+            </div>
+            <div class="form-group">
+                <label for="password">WiFi Password:</label>
+                <input type="password" id="password" name="password" placeholder="Enter WiFi password">
+            </div>
+            <button type="submit">📡 Connect to WiFi</button>
+        </form>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.innerHTML = message;
+            status.className = 'status ' + type;
+        }
+
+        function refreshNetworks() {
+            showStatus('🔍 Scanning WiFi networks...', 'loading');
+            fetch('/scan')
+                .then(response => response.json())
+                .then(data => {
+                    const select = document.getElementById('ssid');
+                    select.innerHTML = '<option value="">Select a network...</option>';
+                    data.networks.forEach(network => {
+                        const option = document.createElement('option');
+                        option.value = network.ssid;
+                        option.textContent = `${network.ssid} (${network.rssi} dBm) ${network.auth ? '🔒' : '📶'}`;
+                        select.appendChild(option);
+                    });
+                    showStatus('✅ Found ' + data.networks.length + ' networks', 'success');
+                })
+                .catch(error => {
+                    showStatus('❌ Failed to scan networks: ' + error, 'error');
+                });
+        }
+
+        document.getElementById('wifiForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const ssid = document.getElementById('ssid').value;
+            const password = document.getElementById('password').value;
+            
+            if (!ssid) {
+                showStatus('⚠️ Please select a WiFi network', 'error');
+                return;
+            }
+
+            showStatus('🔄 Connecting to ' + ssid + '...', 'loading');
+            
+            fetch('/connect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssid: ssid, password: password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showStatus('🎉 Successfully connected! Device will restart...', 'success');
+                    setTimeout(() => {
+                        showStatus('✅ Setup complete! You can now close this page.', 'success');
+                    }, 3000);
+                } else {
+                    showStatus('❌ Connection failed: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                showStatus('❌ Connection error: ' + error, 'error');
+            });
+        });
+
+        // Auto-load networks on page load
+        window.onload = function() {
+            refreshNetworks();
+        };
+    </script>
+</body>
+</html>
+)";
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "📱 Device connected to AP, MAC: " MACSTR, MAC2STR(event->mac));
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "📱 Device disconnected from AP, MAC: " MACSTR, MAC2STR(event->mac));
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "� WiFi station started");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "✅ Connected to WiFi network");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "❌ Disconnected from WiFi network");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "🌐 Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_configured = true;
+    }
+}
+
+std::string generate_device_id() {
+    // Read base MAC without requiring WiFi init
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t chipid = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+    char device_id_str[32];
+    snprintf(device_id_str, sizeof(device_id_str), "esp32_wwd_%08lx", (unsigned long)chipid);
+    return std::string(device_id_str);
+}
+
+bool has_stored_wifi() {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+    
+    size_t required_size = 0;
+    err = nvs_get_str(nvs_handle, "ssid", NULL, &required_size);
+    nvs_close(nvs_handle);
+    
+    return (err == ESP_OK && required_size > 1);
+}
+
+void clear_stored_wifi() {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("wifi", NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_erase_all(nvs_handle);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "🗑️ Cleared stored WiFi credentials");
+    }
+}
+
+// HTTP Handler: Serve the main setup page
+static esp_err_t root_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, setup_page_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP Handler: Scan for WiFi networks
+static esp_err_t scan_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "🔍 Scanning WiFi networks...");
+    
+    // Start WiFi scan
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = {.active = {.min = 100, .max = 300}}
+    };
+    
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan failed");
+        return ESP_FAIL;
+    }
+    
+    // Get scan results
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    
+    if (ap_count == 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"networks\":[]}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    wifi_ap_record_t *ap_records = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * ap_count);
+    esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+    
+    // Build JSON response
+    cJSON *json = cJSON_CreateObject();
+    cJSON *networks = cJSON_CreateArray();
+    
+    for (int i = 0; i < ap_count; i++) {
+        cJSON *network = cJSON_CreateObject();
+        cJSON_AddStringToObject(network, "ssid", (char*)ap_records[i].ssid);
+        cJSON_AddNumberToObject(network, "rssi", ap_records[i].rssi);
+        cJSON_AddBoolToObject(network, "auth", ap_records[i].authmode != WIFI_AUTH_OPEN);
+        cJSON_AddItemToArray(networks, network);
+    }
+    
+    cJSON_AddItemToObject(json, "networks", networks);
+    char *json_string = cJSON_Print(json);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_string, strlen(json_string));
+    
+    free(json_string);
+    cJSON_Delete(json);
+    free(ap_records);
+    
+    ESP_LOGI(TAG, "✅ Found %d networks", ap_count);
+    return ESP_OK;
+}
+
+// HTTP Handler: Connect to WiFi network
+static esp_err_t connect_handler(httpd_req_t *req) {
+    char content[512];
+    size_t recv_size = MIN(req->content_len, sizeof(content));
+    
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    content[ret] = '\0';
+    
+    // Parse JSON
+    cJSON *json = cJSON_Parse(content);
+    if (json == NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    cJSON *ssid_json = cJSON_GetObjectItem(json, "ssid");
+    cJSON *password_json = cJSON_GetObjectItem(json, "password");
+    
+    if (!cJSON_IsString(ssid_json)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SSID");
+        return ESP_FAIL;
+    }
+    
+    const char *ssid = ssid_json->valuestring;
+    const char *password = cJSON_IsString(password_json) ? password_json->valuestring : "";
+    
+    ESP_LOGI(TAG, "🔗 Attempting to connect to WiFi: %s", ssid);
+    
+    // Test WiFi connection
+    bool success = test_wifi_connection(ssid, password);
+    
+    // Prepare response
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddBoolToObject(response, "success", success);
+    if (success) {
+        cJSON_AddStringToObject(response, "message", "Connected successfully");
+        // Store credentials
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open("wifi", NVS_READWRITE, &nvs_handle);
+        if (err == ESP_OK) {
+            nvs_set_str(nvs_handle, "ssid", ssid);
+            nvs_set_str(nvs_handle, "password", password);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+        }
+    } else {
+        cJSON_AddStringToObject(response, "message", "Connection failed");
+    }
+    
+    char *response_string = cJSON_Print(response);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response_string, strlen(response_string));
+    
+    free(response_string);
+    cJSON_Delete(response);
+    cJSON_Delete(json);
+    
+    if (success) {
+        // Restart after a short delay to apply new WiFi settings
+        ESP_LOGI(TAG, "� WiFi configured successfully, restarting in 3 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+    }
+    
+    return ESP_OK;
+}
+
+// HTTP Handler: Get status
+static esp_err_t status_handler(httpd_req_t *req) {
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "device_id", device_id.c_str());
+    cJSON_AddBoolToObject(json, "wifi_configured", wifi_configured);
+    
+    char *json_string = cJSON_Print(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_string, strlen(json_string));
+    
+    free(json_string);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+void start_wifi_ap_provisioning() {
+    ESP_LOGI(TAG, "🔵 Starting WiFi AP provisioning...");
+    
+    // Generate device ID first if not already set
+    if (device_id.empty()) {
+        device_id = generate_device_id();
+        ESP_LOGI(TAG, "Generated device ID: %s", device_id.c_str());
+    }
+    
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    
+    // Initialize WiFi
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // Create WiFi interfaces
+    ap_netif = esp_netif_create_default_wifi_ap();
+    sta_netif = esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    // Register event handler
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    
+    // Configure WiFi AP
+    std::string ap_ssid = "WakeGuard-Setup-" + device_id.substr(device_id.length() - 4);
+    wifi_config_t wifi_config = {};
+    strcpy((char*)wifi_config.ap.ssid, ap_ssid.c_str());
+    wifi_config.ap.ssid_len = strlen(ap_ssid.c_str());
+    strcpy((char*)wifi_config.ap.password, ""); // Open network
+    wifi_config.ap.channel = 1;
+    wifi_config.ap.max_connection = 4;
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "� WiFi AP started: %s", ap_ssid.c_str());
+    ESP_LOGI(TAG, "🌐 Connect to this network and go to: http://192.168.4.1");
+    
+    // Start HTTP server
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.lru_purge_enable = true;
+    
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // Register URI handlers
+        httpd_uri_t root_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &root_uri);
+        
+        httpd_uri_t scan_uri = {
+            .uri = "/scan",
+            .method = HTTP_GET,
+            .handler = scan_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &scan_uri);
+        
+        httpd_uri_t connect_uri = {
+            .uri = "/connect",
+            .method = HTTP_POST,
+            .handler = connect_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &connect_uri);
+        
+        httpd_uri_t status_uri = {
+            .uri = "/status",
+            .method = HTTP_GET,
+            .handler = status_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &status_uri);
+        
+        ESP_LOGI(TAG, "✅ HTTP server started on port 80");
+    } else {
+        ESP_LOGE(TAG, "❌ Failed to start HTTP server");
+    }
+    
+    // Wait for provisioning to complete
+    while (!wifi_configured) {
+        blink_led(1, 500);  // Slow blink to indicate setup mode
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    
+    ESP_LOGI(TAG, "🔵 WiFi provisioning completed");
+}
+
+bool initialize_bluetooth_stack() {
+    // Initialize Bluetooth (BLE GATT)
+    // Free Classic memory since we only use BLE
+    ESP_LOGI(TAG, "🧹 Releasing Classic Bluetooth memory...");
+    esp_err_t r = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "BT Classic mem release failed or already done: %s", esp_err_to_name(r));
+    }
+    
+    // Check available memory before initialization
+    ESP_LOGI(TAG, "💾 Free heap before BT init: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "💾 Minimum free heap: %lu bytes", esp_get_minimum_free_heap_size());
+
+    ESP_LOGI(TAG, "🔧 Initializing Bluetooth controller...");
+    print_bluetooth_status();  // Print initial status
+    
+    // Configure BT controller with explicit memory settings
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    // Reduce memory allocation to avoid potential memory issues
+    bt_cfg.controller_task_stack_size = 3072;
+    bt_cfg.controller_task_prio = 23;
+    bt_cfg.hci_uart_no = 1;
+    bt_cfg.hci_uart_baudrate = 921600;
+    
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to initialize BT controller: %s", esp_err_to_name(ret));
+        print_bluetooth_status();
+        return false;
+    }
+    
+    // Small delay after init
+    vTaskDelay(pdMS_TO_TICKS(100));
+    print_bluetooth_status();
+    
+    ESP_LOGI(TAG, "🔧 Enabling Bluetooth controller...");
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to enable BT controller: %s", esp_err_to_name(ret));
+        print_bluetooth_status();
+        return false;
+    }
+    
+    // Wait for controller to be fully enabled with shorter timeout
+    ESP_LOGI(TAG, "⏳ Waiting for Bluetooth controller to enable...");
+    int retry_count = 0;
+    while (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED && retry_count < 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));  // Longer delay between checks
+        retry_count++;
+        if (retry_count % 10 == 0) {
+            ESP_LOGI(TAG, "Controller status: %d, retry: %d", esp_bt_controller_get_status(), retry_count);
+            print_bluetooth_status();
+        }
+    }
+    
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        ESP_LOGE(TAG, "❌ Bluetooth controller failed to enable after 10 seconds");
+        ESP_LOGE(TAG, "Final controller status: %d", esp_bt_controller_get_status());
+        print_bluetooth_status();
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ Bluetooth controller enabled successfully");
+    print_bluetooth_status();
+
+    ESP_LOGI(TAG, "🔧 Initializing Bluedroid...");
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to initialize Bluedroid: %s", esp_err_to_name(ret));
+        print_bluetooth_status();
+        return false;
+    }
+    
+    // Wait for Bluedroid to be ready with better error handling
+    ESP_LOGI(TAG, "⏳ Waiting for Bluedroid to initialize...");
+    retry_count = 0;
+    while (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_INITIALIZED && retry_count < 50) {
+        vTaskDelay(pdMS_TO_TICKS(100));  // Longer delay between checks
+        retry_count++;
+        if (retry_count % 10 == 0) {
+            ESP_LOGI(TAG, "Bluedroid status: %d, retry: %d", esp_bluedroid_get_status(), retry_count);
+            print_bluetooth_status();
+        }
+    }
+    
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_INITIALIZED) {
+        ESP_LOGE(TAG, "❌ Bluedroid failed to initialize after 5 seconds");
+        ESP_LOGE(TAG, "Final Bluedroid status: %d", esp_bluedroid_get_status());
+        print_bluetooth_status();
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ Bluedroid initialized successfully");
+    print_bluetooth_status();
+    
+    ESP_LOGI(TAG, "🔧 Enabling Bluedroid...");
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to enable Bluedroid: %s", esp_err_to_name(ret));
+        print_bluetooth_status();
+        return false;
+    }
+    
+    // Wait for Bluedroid to be fully enabled
+    ESP_LOGI(TAG, "⏳ Waiting for Bluedroid to enable...");
+    retry_count = 0;
+    while (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED && retry_count < 50) {
+        vTaskDelay(pdMS_TO_TICKS(100));  // Longer delay between checks
+        retry_count++;
+        if (retry_count % 10 == 0) {
+            ESP_LOGI(TAG, "Bluedroid status: %d, retry: %d", esp_bluedroid_get_status(), retry_count);
+            print_bluetooth_status();
+        }
+    }
+    
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+        ESP_LOGE(TAG, "❌ Bluedroid failed to enable after 5 seconds");
+        ESP_LOGE(TAG, "Final Bluedroid status: %d", esp_bluedroid_get_status());
+        print_bluetooth_status();
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ Bluedroid enabled successfully");
+    print_bluetooth_status();
+
+    // Additional delay to ensure stack is fully ready
+    ESP_LOGI(TAG, "⏳ Waiting for Bluetooth stack to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    return true;
+}
+
+void setup_bluetooth_services() {
+    ESP_LOGI(TAG, "🔧 Setting up Bluetooth services...");
+    
+    // Register BLE callbacks with error handling
+    esp_err_t ret = esp_ble_gap_register_callback(gap_ble_event_handler);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to register GAP callback: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to register GATTS callback: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = esp_ble_gatts_app_register(0x55);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to register GATTS app: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Verify stack is still ready before proceeding
+    if (!is_bluetooth_stack_ready()) {
+        ESP_LOGE(TAG, "❌ Bluetooth stack not ready after callback registration");
+        return;
+    }
+
+    // Set device name and configure advertising data
+    std::string bt_name = "WakeGuard-" + device_id.substr(device_id.length() - 4);
+    ESP_LOGI(TAG, "Setting BLE device name: %s", bt_name.c_str());
+    ret = esp_ble_gap_set_device_name(bt_name.c_str());
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to set device name: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Wait a bit before configuring advertising
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // Verify stack is still ready before configuring advertising
+    if (!is_bluetooth_stack_ready()) {
+        ESP_LOGE(TAG, "❌ Bluetooth stack not ready before advertising configuration");
+        return;
+    }
+    
+    ret = esp_ble_gap_config_adv_data(&adv_data);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to configure advertising data: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "🔵 Bluetooth (BLE) starting as: %s", bt_name.c_str());
+    ESP_LOGI(TAG, "📱 Waiting for app connection (BLE)...");
+    
+    // Final verification that stack is ready
+    if (!is_bluetooth_stack_ready()) {
+        ESP_LOGE(TAG, "❌ Bluetooth stack not ready before entering provisioning loop");
+        return;
+    }
+    
+    // Wait for provisioning to complete
+    while (!wifi_configured) {
+        // Check if Bluetooth stack is still healthy
+        if (!is_bluetooth_stack_ready()) {
+            ESP_LOGE(TAG, "❌ Bluetooth stack became unhealthy during provisioning");
+            break;
+        }
+        
+        blink_led(1, 500);  // Slow blink
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Cleanup Bluetooth
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    
+    ESP_LOGI(TAG, "🔵 Bluetooth provisioning completed");
+}
+
+// BLE GAP callback
+static void gap_ble_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT: {
+            ESP_LOGI(TAG, "✅ ADV data configured; starting advertising");
+            esp_err_t ret = esp_ble_gap_start_advertising(&adv_params);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "🚀 BLE advertising started successfully");
+            } else {
+                ESP_LOGE(TAG, "❌ Failed to start advertising: %s", esp_err_to_name(ret));
+            }
+            break;
+        }
+        case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT: {
+            ESP_LOGI(TAG, "✅ Scan response configured");
+            break;
+        }
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT: {
+            if (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGI(TAG, "🔵 BLE advertising is now ACTIVE and DISCOVERABLE!");
+            } else {
+                ESP_LOGE(TAG, "❌ Failed to start advertising: status=%d", param->adv_start_cmpl.status);
+            }
+            break;
+        }
+        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT: {
+            ESP_LOGI(TAG, "🔴 Advertising stopped");
+            break;
+        }
+        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT: {
+            ESP_LOGI(TAG, "🔄 Conn params updated: min_int=%d max_int=%d", param->update_conn_params.min_int, param->update_conn_params.max_int);
+            break;
+        }
+        default:
+            ESP_LOGD(TAG, "GAP event: %d", event);
+            break;
+    }
+}
+
+// BLE GATTS callback
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    if (event == ESP_GATTS_REG_EVT) {
+        g_gatts_if = gatts_if;
+        // Create a primary service
+        esp_gatt_srvc_id_t service_id = {};
+        service_id.is_primary = true;
+        service_id.id.inst_id = 0x00;
+        service_id.id.uuid.len = ESP_UUID_LEN_16;
+        service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID;
+        esp_ble_gatts_create_service(gatts_if, &service_id, 6 /*num handles*/);
+        return;
+    }
+
+    switch (event) {
+        case ESP_GATTS_CREATE_EVT: {
+            if (param->create.status == ESP_GATT_OK) {
+                g_service_handle = param->create.service_handle;
+                esp_ble_gatts_start_service(g_service_handle);
+
+                // Add TX characteristic (notify)
+                esp_bt_uuid_t char_uuid = {};
+                char_uuid.len = ESP_UUID_LEN_16;
+                char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_TX;
+                esp_gatt_perm_t perm = ESP_GATT_PERM_READ;
+                esp_gatt_char_prop_t prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+                esp_ble_gatts_add_char(g_service_handle, &char_uuid, perm, prop, NULL, NULL);
+            } else {
+                ESP_LOGE(TAG, "Service create failed: %d", param->create.status);
+            }
+            break;
+        }
+        case ESP_GATTS_ADD_CHAR_EVT: {
+            uint16_t added_uuid = param->add_char.char_uuid.uuid.uuid16;
+            if (added_uuid == GATTS_CHAR_UUID_TX) {
+                g_char_tx_handle = param->add_char.attr_handle;
+                // Add CCCD for notifications
+                esp_bt_uuid_t cccd_uuid = {};
+                cccd_uuid.len = ESP_UUID_LEN_16;
+                cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+                esp_ble_gatts_add_char_descr(g_service_handle, &cccd_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+            } else if (added_uuid == GATTS_CHAR_UUID_RX) {
+                g_char_rx_handle = param->add_char.attr_handle;
+            }
+            break;
+        }
+        case ESP_GATTS_ADD_CHAR_DESCR_EVT: {
+            // After TX+CCCD, add RX characteristic (write without response)
+            esp_bt_uuid_t char_uuid = {};
+            char_uuid.len = ESP_UUID_LEN_16;
+            char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_RX;
+            esp_gatt_perm_t perm = ESP_GATT_PERM_WRITE;
+            esp_gatt_char_prop_t prop = ESP_GATT_CHAR_PROP_BIT_WRITE_NR | ESP_GATT_CHAR_PROP_BIT_WRITE;
+            esp_ble_gatts_add_char(g_service_handle, &char_uuid, perm, prop, NULL, NULL);
+            break;
+        }
+        case ESP_GATTS_CONNECT_EVT: {
+            g_conn_id = param->connect.conn_id;
+            g_ble_connected = true;
+            ESP_LOGI(TAG, "BLE connected (conn_id=%u)", g_conn_id);
+            break;
+        }
+        case ESP_GATTS_DISCONNECT_EVT: {
+            g_ble_connected = false;
+            g_conn_id = 0xFFFF;
+            ESP_LOGI(TAG, "BLE disconnected, restarting advertising");
+            esp_ble_gap_start_advertising(&adv_params);
+            break;
+        }
+        case ESP_GATTS_WRITE_EVT: {
+            // Handle writes to RX characteristic
+            if (param->write.handle == g_char_rx_handle && param->write.len > 0) {
+                // Ensure null-termination; copy to buffer
+                size_t len = param->write.len;
+                char *buf = (char*)malloc(len + 1);
+                if (buf) {
+                    memcpy(buf, param->write.value, len);
+                    buf[len] = '\0';
+                    ESP_LOGI(TAG, "📨 BLE RX: %s", buf);
+                    handle_json_command(buf);
+                    free(buf);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void handle_json_command(const char* json_str) {
+    cJSON *json = cJSON_Parse(json_str);
+    if (json == NULL) {
+        ESP_LOGE(TAG, "❌ Failed to parse JSON");
+        return;
+    }
+    
+    cJSON *command = cJSON_GetObjectItem(json, "command");
+    if (!cJSON_IsString(command)) {
+        ESP_LOGE(TAG, "❌ No command field found");
+        cJSON_Delete(json);
+        return;
+    }
+    
+    const char* cmd = cJSON_GetStringValue(command);
+    
+    if (strcmp(cmd, "get_device_id") == 0) {
+        // Send device ID response
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddStringToObject(response, "deviceId", device_id.c_str());
+        cJSON_AddStringToObject(response, "status", "ready");
+        
+        char *json_string = cJSON_Print(response);
+        send_json_response(json_string);
+        
+        cJSON_Delete(response);
+        free(json_string);
+        
+        ESP_LOGI(TAG, "📤 Sent device ID: %s", device_id.c_str());
+    }
+    else if (strcmp(cmd, "set_wifi") == 0) {
+        cJSON *ssid = cJSON_GetObjectItem(json, "ssid");
+        cJSON *password = cJSON_GetObjectItem(json, "password");
+        
+        if (cJSON_IsString(ssid) && cJSON_IsString(password)) {
+            const char* ssid_str = cJSON_GetStringValue(ssid);
+            const char* password_str = cJSON_GetStringValue(password);
+            
+            ESP_LOGI(TAG, "� Configuring WiFi: %s", ssid_str);
+            
+            // Test WiFi connection
+            bool wifi_success = test_wifi_connection(ssid_str, password_str);
+            
+            cJSON *response = cJSON_CreateObject();
+            if (wifi_success) {
+                // Save credentials to NVS
+                nvs_handle_t nvs_handle;
+                ESP_ERROR_CHECK(nvs_open("wifi", NVS_READWRITE, &nvs_handle));
+                ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "ssid", ssid_str));
+                ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "password", password_str));
+                ESP_ERROR_CHECK(nvs_commit(nvs_handle));
+                nvs_close(nvs_handle);
+                
+                cJSON_AddBoolToObject(response, "success", true);
+                cJSON_AddStringToObject(response, "message", "WiFi configured successfully");
+                
+                wifi_configured = true;
+                ESP_LOGI(TAG, "✅ WiFi configured successfully!");
+            } else {
+                cJSON_AddBoolToObject(response, "success", false);
+                cJSON_AddStringToObject(response, "message", "WiFi connection failed");
+                ESP_LOGE(TAG, "❌ WiFi connection failed");
+            }
+            
+            char *json_string = cJSON_Print(response);
+            send_json_response(json_string);
+            
+            cJSON_Delete(response);
+            free(json_string);
+        }
+    }
+    
+    cJSON_Delete(json);
+}
+
+void send_json_response(const char* json_str) {
+    if (g_ble_connected && g_char_tx_handle != 0 && g_gatts_if != ESP_GATT_IF_NONE) {
+        const uint8_t *data = (const uint8_t *)json_str;
+        uint16_t total = (uint16_t)strlen(json_str);
+        // BLE notify payload limited by MTU; send in small chunks (<=180 bytes)
+        const uint16_t CHUNK = 180;
+        uint16_t sent = 0;
+        while (sent < total) {
+            uint16_t n = (total - sent) > CHUNK ? CHUNK : (total - sent);
+            esp_err_t e = esp_ble_gatts_send_indicate(g_gatts_if, g_conn_id, g_char_tx_handle, n, (uint8_t*)(data + sent), false);
+            if (e != ESP_OK) {
+                ESP_LOGW(TAG, "Notify failed: %s", esp_err_to_name(e));
+                break;
+            }
+            sent += n;
+            // small delay to avoid congesting the stack
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        ESP_LOGI(TAG, "📤 Sent response (BLE): %s", json_str);
+    } else {
+        ESP_LOGW(TAG, "BLE not connected; cannot send response");
+    }
+}
+
+bool test_wifi_connection(const char* ssid, const char* password) {
+    // Initialize WiFi
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "� Testing WiFi connection...");
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    
+    // Wait for connection (up to 10 seconds)
+    bool connected = false;
+    for (int i = 0; i < 20; i++) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            connected = true;
+            ESP_LOGI(TAG, "✅ WiFi test successful");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Cleanup
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    
+    return connected;
+}
+
+void connect_to_stored_wifi() {
+    ESP_LOGI(TAG, "🔗 This function is handled by WiFiManager");
+    // This function is now handled by the main WiFiManager class
+    // We just need to ensure the credentials are stored properly
+}
+
+void blink_led(int times, int delay_ms) {
+    for (int i = 0; i < times; i++) {
+        gpio_set_level(LED_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        gpio_set_level(LED_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+}

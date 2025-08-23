@@ -5,9 +5,10 @@
 #define I2S_SAMPLE_BYTES (4)     // The total aboumt of bytes per sample
 #define I2S_SAMPLE_RATE (16000)  // The total amount of samples per second
 
-// WiFi Configuration
-#define WIFI_SSID "DNA-WIFI-A474"
-#define WIFI_PASSWORD "7tADYEhq"
+// WiFi Configuration (will be set via Bluetooth provisioning)
+// Note: WIFI_SSID and WIFI_PASSWORD are now loaded from NVS storage
+#define WIFI_SSID_DEFAULT "YourWiFiNetwork"
+#define WIFI_PASSWORD_DEFAULT "YourPassword"
 
 // MQTT Configuration
 #define MQTT_BROKER_HOST "192.168.1.176"  // Replace with your Raspberry Pi IP
